@@ -122,29 +122,44 @@ class MusicCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
-        # Desconectar se o bot ficar sozinho no canal
-        gid = int(member.guild.id)
-        if gid not in self.vc or not self.vc.get(gid): # Verifica se o estado do servidor foi inicializado
-             await self.initialize_guild_state(gid) # Inicializa se não foi
-
-        # Verifica se o bot estava conectado
-        if not self.vc.get(gid) or not self.vc[gid].is_connected():
+        # Ignora se foi o próprio bot que entrou/moveu
+        if member.id == self.bot.user.id:
             return
 
-        # Verifica se o canal de antes existe e é diferente do canal de depois (ou se saiu do canal)
-        if member.id != self.bot.user.id and before.channel and (not after.channel or after.channel.id != before.channel.id):
-            # Verifica se o canal que o membro saiu é o canal onde o bot está e os membros restantes, sem contar outros bots 
-            if before.channel.id == self.vc[gid].channel.id:
-                remaining_members = self.vc[gid].channel.members
-                human_members = [m for m in remaining_members if not m.bot]
+        gid = member.guild.id
+        
+        # Verifica se o bot está conectado nesse servidor
+        if gid not in self.vc or not self.vc[gid] or not self.vc[gid].is_connected():
+            return
 
-                if not human_members: 
-                    print(f"Bot sozinho no canal {before.channel.name}, desconectando...")
-                    self.is_playing[gid] = self.is_paused[gid] = False
-                    self.musicQueue[gid] = []
-                    self.queueIndex[gid] = 0
-                    await self.vc[gid].disconnect()
-                    self.vc[gid] = None
+        voice_channel = self.vc[gid].channel
+
+        # Se a pessoa saiu do canal onde o bot está
+        if before.channel and before.channel.id == voice_channel.id:
+            # Conta quantos membros REAIS (não bots) sobraram
+            members = voice_channel.members
+            non_bot_members = [m for m in members if not m.bot]
+
+            if not non_bot_members:
+                # Espera um pouco antes de sair (vai que alguém entra logo em seguida)
+                await asyncio.sleep(15) 
+                
+                # Verifica de novo após o tempo
+                # Precisamos atualizar a lista de membros
+                voice_channel = self.bot.get_channel(voice_channel.id)
+                if voice_channel: # Se o canal ainda existe
+                    members = voice_channel.members
+                    non_bot_members = [m for m in members if not m.bot]
+                    
+                    # Se ainda estiver vazio e o bot ainda estiver lá
+                    if not non_bot_members and self.vc[gid].is_connected():
+                        print(f"Canal vazio em {member.guild.name}, desconectando...")
+                        # Limpa variáveis
+                        self.is_playing[gid] = False
+                        self.is_paused[gid] = False
+                        self.musicQueue[gid] = []
+                        self.queueIndex[gid] = 0
+                        await self.vc[gid].disconnect()
 
 
     # Funções de Embed 
@@ -186,20 +201,30 @@ class MusicCog(commands.Cog):
     # Garante que o bot entre no canal
     async def join_VC(self, ctx, channel):
         gid = int(ctx.guild.id)
-        if gid not in self.vc: await self.initialize_guild_state(gid)
+        # Garante que a chave existe no dicionário
+        if gid not in self.vc: 
+            self.vc[gid] = None
 
-        if self.vc.get(gid) is None or not self.vc[gid].is_connected():
-            self.vc[gid] = await channel.connect()
-            if self.vc[gid]:
-                print(f"Conectado ao canal de voz: {channel.name} no servidor {ctx.guild.name}")
+        # Pega o cliente de voz oficial do servidor (a "verdade" do Discord)
+        voice_client = ctx.guild.voice_client
+
+        try:
+            # Se já estiver conectado no servidor
+            if voice_client and voice_client.is_connected():
+                self.vc[gid] = voice_client # Atualiza a variável interna
+                
+                # Se estiver no canal errado, move para o certo
+                if voice_client.channel.id != channel.id:
+                    await voice_client.move_to(channel)
             else:
-                 print(f"Falha ao conectar no canal de voz: {channel.name}")
-                 await ctx.send("Não consegui me conectar ao canal de voz.")
-                 return False
-        elif self.vc[gid].channel.id != channel.id:
-             print(f"Movendo para o canal de voz: {channel.name} no servidor {ctx.guild.name}")
-             await self.vc[gid].move_to(channel)
-
+                # Se não estiver conectado, conecta agora
+                self.vc[gid] = await channel.connect()
+                
+        except Exception as e:
+            print(f"Erro no join_VC: {e}")
+            await ctx.send("❌ Tive um problema ao conectar no canal de voz.")
+            return False
+        
         return True
 
 
@@ -220,40 +245,52 @@ class MusicCog(commands.Cog):
 
     # Função para mostrar os 10 primeiros resultados de uma pesquisa
     def search_YT(self, search):
-        query = parse.urlencode({"search_query": search})
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'quiet': True,
+            'extract_flat': True, # Apenas extrai metadados, não baixa nada (rápido)
+            'noplaylist': True,
+            'limit': 10 # Limite de resultados
+        }
         try:
-            # Adiciona um User-Agent para parecer um navegador comum
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-            req = request.Request(f"https://www.youtube.com/results?{query}", headers=headers)
-            with request.urlopen(req) as html:
-                video_ids = re.findall(r"watch\?v=(\S{11})", html.read().decode())
-            # Remove duplicados mantendo a ordem e pega os 10 primeiros resultados únicos
-            return list(dict.fromkeys(video_ids))[:10]
+            with YoutubeDL(ydl_opts) as ydl:
+                # O prefixo ytsearch10: diz para buscar 10 resultados
+                info = ydl.extract_info(f"ytsearch10:{search}", download=False)
+                
+                # Retorna apenas os IDs dos vídeos encontrados
+                if 'entries' in info:
+                    return [entry['id'] for entry in info['entries']]
+                return []
         except Exception as e:
-            print(f"Erro ao buscar no YouTube com regex: {e}")
+            print(f"Erro ao buscar no YouTube com yt-dlp: {e}")
             return []
 
     # Função para pegar o áudio da música no Youtube
     async def extract_YT(self, url):
         def sync_extract():
-            #Opções da extração
             ydl_opts = {
                 'format': 'bestaudio/best',
                 'noplaylist': True,
                 'quiet': True,
                 'extract_flat': False,
-                'force_generic_extractor': False,
-                'source_address': '0.0.0.0'
+                'source_address': '0.0.0.0', # <--- OBRIGATÓRIO: Força IPv4 para não travar
+                'default_search': 'auto',
+                'nocheckcertificate': True,
+                'ignoreerrors': False,
+                'logtostderr': False,
+                'no_warnings': True,
             }
             try:
                 with YoutubeDL(ydl_opts) as ydl:
+                    # Se não for link, força a busca
+                    if not url.startswith("http"):
+                        url = f"ytsearch1:{url}"
+                        
                     info = ydl.extract_info(url, download=False)
-                    # Verifica se é um vídeo único
+                    
                     if 'entries' in info:
-                         # Se for uma lista, pega o primeiro
-                         info = info['entries'][0]
+                        info = info['entries'][0]
 
-                    # Limpa os dados antes de retornar
                     return {
                         'link': info.get('webpage_url', url),
                         'thumbnail': info.get('thumbnail'),
@@ -262,7 +299,7 @@ class MusicCog(commands.Cog):
                         'duration': info.get('duration'),
                     }
             except Exception as e:
-                print(f"Erro no yt-dlp ao extrair '{url}': {e}")
+                print(f"Erro no yt-dlp: {e}")
                 return None 
         return await asyncio.to_thread(sync_extract)
     
@@ -385,25 +422,39 @@ class MusicCog(commands.Cog):
         if gid not in self.musicQueue: 
             await self.initialize_guild_state(gid)
 
-        if self.queueIndex[gid] < len(self.musicQueue[gid]):
-            if not ctx.voice_client: # Se não estiver conectado, tenta conectar no canal atual
-                target_channel = self.musicQueue[gid][self.queueIndex[gid]][1] 
-                if not await self.join_VC(ctx, target_channel):
-                     await ctx.send("Não foi possível conectar ao canal de voz para tocar a música.")
-                     self.is_playing[gid] = False
-                     self.is_paused[gid] = False
-                     return
-
-            self.is_playing[gid] = True
-            self.is_paused[gid] = False
+        if self.musicQueue[gid]: # Se tem música na fila
+            # Pega a música atual sem remover (usando o índice)
+            if self.queueIndex[gid] >= len(self.musicQueue[gid]):
+                self.is_playing[gid] = False
+                return
 
             song_info = self.musicQueue[gid][self.queueIndex[gid]]
             song = song_info[0]
+            channel_to_join = song_info[1]
+
+            # --- CORREÇÃO DE CONEXÃO ---
+            voice_client = ctx.guild.voice_client
+            
+            # Se não estiver conectado, conecta
+            if not voice_client or not voice_client.is_connected():
+                connected = await self.join_VC(ctx, channel_to_join)
+                if not connected:
+                    await ctx.send("Não consegui conectar ao canal.")
+                    return
+                # O PULO DO GATO: Espera 1.5s para o Discord firmar a conexão
+                await asyncio.sleep(1.5)
+                # Atualiza a variável após conectar
+                voice_client = ctx.guild.voice_client 
+
+            # Garante que a referência interna esteja atualizada
+            self.vc[gid] = voice_client
+
+            self.is_playing[gid] = True
+            self.is_paused[gid] = False
             source = song.get('source')
 
-            # Se não conseguir tocar a música, ele tenta tocar a próxima, se houver
             if not source:
-                 await ctx.send(f"Erro: Não foi possível obter o link para tocar '{song.get('title')}'. Pulando...")
+                 # Lógica de pular se link for ruim
                  self.queueIndex[gid] += 1
                  await self.play_music(ctx)
                  return
@@ -411,48 +462,43 @@ class MusicCog(commands.Cog):
             await ctx.send(embed=self.now_playing_embed(gid, song))
 
             try:
-                 # Garante que está conectado antes de tocar
-                 if not self.vc.get(gid) or not self.vc[gid].is_connected():
-                      target_channel = song_info[1]
-                      if not await self.join_VC(ctx, target_channel):
-                           await ctx.send("Perdi a conexão de voz antes de tocar.")
-                           self.is_playing[gid] = False
-                           return
-
-                 self.vc[gid].play(
+                 voice_client.play(
                      discord.FFmpegPCMAudio(source, **self.FFMPEG_OPTIONS),
                      after=lambda e: self.play_next_safe(ctx, e)
                  )
-            except discord.errors.ClientException as e:
-                  await ctx.send(f"Erro ao tentar tocar: {e}. Verifique se já não estou tocando algo.")
-                  self.is_playing[gid] = False # Reseta estado se deu erro ao iniciar
             except Exception as e:
-                 await ctx.send(f"Ocorreu um erro inesperado ao iniciar a música: {e}")
-                 print(f"Erro ao iniciar playback em play_music para {song.get('title')}: {e}")
+                 print(f"Erro ao iniciar playback: {e}")
                  self.is_playing[gid] = False
+                 # Se der erro, tenta tocar a próxima em vez de desconectar
+                 self.play_next(ctx)
         else:
-            print(f"play_music chamado com índice ({self.queueIndex[gid]}) fora do tamanho da fila ({len(self.musicQueue[gid])})")
             self.is_playing[gid] = False
-            await ctx.send("Não há músicas na fila para tocar.")
-
 
     # -Comandos do Bot- 
     # Comando para tocar música
-    @commands.command(name='play', aliases=['tocar', 'p'], help='Toca uma música ou adiciona à fila.')
+    @commands.command(name='play', aliases=['tocar', 'p'])
     async def play(self, ctx, *, search: str = None):
         gid = int(ctx.guild.id)
         if gid not in self.musicQueue: await self.initialize_guild_state(gid)
 
-        try:
-            userChannel = ctx.author.voice.channel
-            if not userChannel:
-                await ctx.send("Você precisa estar em um canal de voz para usar este comando!")
-                return
-        except AttributeError:
-            await ctx.send("Você precisa estar em um canal de voz para usar este comando!")
+        # 1. Verifica se o usuário está em um canal
+        if not ctx.author.voice or not ctx.author.voice.channel:
+            await ctx.send("🚫 Você precisa estar em um canal de voz para tocar música!")
             return
 
-        # Se !play for usado sem digitar nada e algo estiver pausado, retoma a música atual
+        user_channel = ctx.author.voice.channel
+
+        # 2. SE O BOT NÃO ESTIVER CONECTADO, CONECTA AGORA (ANTES DE PESQUISAR)
+        # Isso resolve o problema dele entrar e sair, pois garante a conexão estável.
+        voice_client = ctx.guild.voice_client
+        if not voice_client or not voice_client.is_connected():
+            success = await self.join_VC(ctx, user_channel)
+            if not success:
+                return # Se falhar ao conectar, para tudo.
+            # Pequena pausa para garantir o handshake do Discord
+            await asyncio.sleep(1)
+
+        # Lógica de Resume (se não digitou nada)
         if search is None:
             if self.is_paused[gid] and self.vc.get(gid):
                 self.vc[gid].resume()
@@ -460,51 +506,44 @@ class MusicCog(commands.Cog):
                 self.is_paused[gid] = False
                 await ctx.send("▶️ Retomado!")
                 return
-            elif not self.is_playing[gid] and self.musicQueue[gid] and self.queueIndex[gid] < len(self.musicQueue[gid]):
-                 await ctx.send("Reiniciando a música atual na fila...")
+            elif not self.is_playing[gid] and self.musicQueue[gid]:
                  await self.play_music(ctx)
                  return
-            elif self.is_playing[gid]:
-                 await ctx.send("Já estou tocando algo. Use '!add' ou '!play <nome>' para adicionar à fila.")
-                 return
             else:
-                 await ctx.send("A fila está vazia e nada está pausado. Use '!play <nome>' para tocar algo.")
+                 await ctx.send("Use `!play <nome da música>`.")
                  return
 
-        await ctx.send(f"🔎 Procurando por `{search}`...")
+        # 3. Agora que já estamos conectados, fazemos a busca (pesada)
+        msg_procurando = await ctx.send(f"🔎 Procurando por `{search}`...")
 
-        # Tenta extrair diretamente se for uma URL
-        if "youtube.com/watch?v=" in search or "youtu.be/" in search:
-             song = await self.extract_YT(search)
-        else:
-             # Se não for URL, ele pesquisa
-             video_ids = self.search_YT(search)
-             if not video_ids:
-                 await ctx.send(f"Não encontrei resultados para `{search}` no YouTube.")
-                 return
-             # Pega o primeiro resultado da busca
-             first_result_url = f"https://www.youtube.com/watch?v={video_ids[0]}"
-             song = await self.extract_YT(first_result_url)
+        try:
+            # Tenta extrair a música
+            song = await self.extract_YT(search)
+            
+            if not song or not song.get('source'):
+                await msg_procurando.edit(content=f"❌ Não encontrei nada para `{search}` ou o YouTube bloqueou a busca.")
+                return
 
-        if not song or not song.get('source'):
-            await ctx.send(f"Não consegui obter informações ou o link de áudio para `{search}`. Tente novamente ou com outros termos.")
-            return
+            # Adiciona na fila
+            self.musicQueue[gid].append([song, user_channel])
+            
+            await msg_procurando.delete() # Apaga a mensagem de "procurando"
 
-        self.musicQueue[gid].append([song, userChannel])
-
-        # Se nada estiver tocando nem pausado, começa a tocar a música adicionada
-        if not self.is_playing[gid] and not self.is_paused[gid]:
-             if len(self.musicQueue[gid]) == 1:
-                  self.queueIndex[gid] = 0
-             # Se já havia músicas mas não estava tocando e ajusta o índice para a última adicionada
-             elif self.queueIndex[gid] >= len(self.musicQueue[gid]) -1 :
-                   self.queueIndex[gid] = len(self.musicQueue[gid]) - 1
-
-
-             await self.play_music(ctx)
-        else:
-            # Se já está tocando ou pausado, apenas adiciona à fila e informa
-            await ctx.send(embed=self.added_song_embed(ctx, song))
+            # Se não estiver tocando, toca agora
+            if not self.is_playing[gid] and not self.is_paused[gid]:
+                # Reseta o índice se for a primeira música
+                if len(self.musicQueue[gid]) == 1:
+                    self.queueIndex[gid] = 0
+                else:
+                    self.queueIndex[gid] = len(self.musicQueue[gid]) - 1
+                
+                await self.play_music(ctx)
+            else:
+                await ctx.send(embed=self.added_song_embed(ctx, song))
+                
+        except Exception as e:
+            print(f"Erro fatal no comando play: {e}")
+            await ctx.send("Ocorreu um erro ao processar seu pedido.")
 
     # Comando para dar loop
     @commands.command(name='loop', aliases=['repeat'], help='Define o modo de repetição (single/queue/off).')
@@ -930,20 +969,20 @@ class MusicCog(commands.Cog):
         self.is_paused[gid] = False
 
     # Comando para o bot entrar no canal
-    @commands.command(name='join', aliases=['entrar', 'j'], help='Faz o bot entrar no seu canal de voz.')
+    @commands.command(name='join', aliases=['entrar', 'j'])
     async def join(self, ctx):
-        try:
-            channel = ctx.author.voice.channel
-            if not channel:
-                 await ctx.send("Você não está em um canal de voz!")
-                 return
-            if await self.join_VC(ctx, channel):
-                 await ctx.send(f"Entrei em: **{channel.name}** 👋")
-        except AttributeError:
-             await ctx.send("Você não está em um canal de voz!")
-        except Exception as e:
-             await ctx.send(f"Ocorreu um erro ao tentar entrar no canal: {e}")
-             print(f"Erro no comando join: {e}")
+        # Verifica se quem chamou está em um canal
+        if not ctx.author.voice or not ctx.author.voice.channel:
+            await ctx.send("🚫 Você precisa estar em um canal de voz!")
+            return
+
+        channel = ctx.author.voice.channel
+        
+        # Chama a função join_VC corrigida
+        sucesso = await self.join_VC(ctx, channel)
+        
+        if sucesso:
+            await ctx.send(f"✅ Entrei em **{channel.name}**!")
 
     @commands.command(name='leave', aliases=['sair', 'l', 'disconnect'], help='Faz o bot sair do canal de voz.')
     async def leave(self, ctx):
